@@ -15,6 +15,18 @@ Semantics
   (``lower > upper``), inverted timing (``issue_time > target_time``), and any
   target time that lacks either a cutoff-available prediction or an actual
   value reject the entire batch.
+
+The work is split into two phases so the expensive prediction-CSV parse can be
+cached independently of any particular backtest:
+
+* :func:`parse_predictions` / :func:`parse_actuals` turn raw CSV bytes into
+  validated, cutoff-independent row objects (and collect row-level errors).
+* :func:`evaluate_backtest` performs the cutoff selection, atomic completeness
+  check and statistics on top of those parsed rows.
+
+:func:`run_backtest` preserves the original one-shot API on top of the two
+phases; the HTTP layer feeds cached prediction parses into
+:func:`evaluate_backtest` directly.
 """
 
 from __future__ import annotations
@@ -54,6 +66,47 @@ class Interval:
     target_time: datetime
     lower: float
     upper: float
+
+
+# A fully parsed, cutoff-independent prediction row. ``row_no`` is the 1-based
+# CSV line number (the header is line 1), kept so error messages stay identical
+# to the one-shot path.
+@dataclass(frozen=True)
+class ParsedPrediction:
+    row_no: int
+    series_id: str
+    issue_time: datetime
+    target_time: datetime
+    lower: float
+    upper: float
+
+    @property
+    def interval(self) -> Interval:
+        return Interval(
+            self.series_id, self.issue_time, self.target_time, self.lower, self.upper
+        )
+
+
+@dataclass(frozen=True)
+class ParsedActual:
+    row_no: int
+    series_id: str
+    target_time: datetime
+    actual: float
+
+
+@dataclass(frozen=True)
+class ParsedPredictions:
+    rows: tuple[ParsedPrediction, ...]
+    errors: tuple[str, ...]
+    row_count: int
+
+
+@dataclass(frozen=True)
+class ParsedActuals:
+    rows: tuple[ParsedActual, ...]
+    errors: tuple[str, ...]
+    row_count: int
 
 
 @dataclass
@@ -98,13 +151,18 @@ def _parse_utc(value: str, field_name: str, row_no: int) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def _parse_cutoff(value: str) -> datetime:
+def parse_cutoff(value: str) -> datetime:
+    """Parse the evaluation cutoff, rejecting empty or malformed input."""
     if not value or not value.strip():
         raise ValidationError(["evaluation cutoff time is required"])
     try:
         return _parse_utc(value, "cutoff", 0)
     except ValueError as exc:
         raise ValidationError([f"invalid evaluation cutoff: {exc}"]) from exc
+
+
+# Backwards-compatible private alias used by older callers/tests.
+_parse_cutoff = parse_cutoff
 
 
 def _parse_number(value: str, field_name: str, row_no: int) -> float:
@@ -170,28 +228,21 @@ def _iso(value: datetime) -> str:
     return value.isoformat().replace("+00:00", "Z")
 
 
-def run_backtest(
-    *,
-    prediction_csv: bytes,
-    actual_csv: bytes,
-    cutoff_raw: str,
-) -> BacktestResult:
-    cutoff = _parse_cutoff(cutoff_raw)
+# ----------------------------------------------------------------- phase 1
+
+
+def parse_predictions(prediction_csv: bytes) -> ParsedPredictions:
+    """Parse and row-validate a prediction CSV.
+
+    The result is deterministic for the given bytes and never depends on the
+    cutoff, which is what makes it safe to cache in the prediction index.
+    Structural problems (encoding, header, missing columns) are raised as
+    :class:`ValidationError`; per-row problems are collected into ``errors``.
+    """
     pred_rows = _read_csv(prediction_csv, "prediction", PREDICTION_COLUMNS)
-    actual_rows = _read_csv(actual_csv, "actual", ACTUAL_COLUMNS)
-
     errors: list[str] = []
-    warnings: list[str] = []
-    if not pred_rows:
-        errors.append("prediction CSV contains no data rows")
-    if not actual_rows:
-        errors.append("actual CSV contains no data rows")
-
-    # ---- parse and validate predictions -----------------------------------
-    selected: dict[tuple[str, datetime], Interval] = {}
-    seen_predictions: dict[tuple[str, datetime, datetime], Interval] = {}
-    all_prediction_keys: set[tuple[str, datetime]] = set()
-    ignored_after_cutoff = 0
+    parsed: list[ParsedPrediction] = []
+    seen: dict[tuple[str, datetime, datetime], Interval] = {}
 
     for row in pred_rows:
         row_no = int(row["__row__"])
@@ -222,7 +273,7 @@ def run_backtest(
 
         interval = Interval(series_id, issue_time, target_time, lower, upper)
         identity = (series_id, issue_time, target_time)
-        previous = seen_predictions.get(identity)
+        previous = seen.get(identity)
         if previous is not None:
             if (previous.lower, previous.upper) == (lower, upper):
                 errors.append(
@@ -236,19 +287,25 @@ def run_backtest(
                     f"{_iso(target_time)}"
                 )
             continue
-        seen_predictions[identity] = interval
-        all_prediction_keys.add((series_id, target_time))
+        seen[identity] = interval
+        parsed.append(
+            ParsedPrediction(row_no, series_id, issue_time, target_time, lower, upper)
+        )
 
-        if issue_time > cutoff:
-            ignored_after_cutoff += 1
-            continue
-        key = (series_id, target_time)
-        current = selected.get(key)
-        if current is None or issue_time > current.issue_time:
-            selected[key] = interval
+    return ParsedPredictions(
+        rows=tuple(parsed),
+        errors=tuple(errors),
+        row_count=len(pred_rows),
+    )
 
-    # ---- parse and validate actuals ---------------------------------------
-    actuals: dict[tuple[str, datetime], float] = {}
+
+def parse_actuals(actual_csv: bytes) -> ParsedActuals:
+    """Parse and row-validate an actual-values CSV (cached per request only)."""
+    actual_rows = _read_csv(actual_csv, "actual", ACTUAL_COLUMNS)
+    errors: list[str] = []
+    parsed: list[ParsedActual] = []
+    seen: set[tuple[str, datetime]] = set()
+
     for row in actual_rows:
         row_no = int(row["__row__"])
         try:
@@ -261,20 +318,70 @@ def run_backtest(
             errors.append(str(exc))
             continue
         key = (series_id, target_time)
-        if key in actuals:
+        if key in seen:
             errors.append(
                 f"row {row_no}: duplicate actual value for series {series_id!r} "
                 f"at target {_iso(target_time)}"
             )
             continue
-        actuals[key] = actual
+        seen.add(key)
+        parsed.append(ParsedActual(row_no, series_id, target_time, actual))
+
+    return ParsedActuals(
+        rows=tuple(parsed),
+        errors=tuple(errors),
+        row_count=len(actual_rows),
+    )
+
+
+# ----------------------------------------------------------------- phase 2
+
+
+def evaluate_backtest(
+    *,
+    cutoff: datetime,
+    predictions: ParsedPredictions,
+    actuals: ParsedActuals,
+) -> BacktestResult:
+    """Run cutoff selection, the atomic completeness check and statistics.
+
+    All validation stays all-or-nothing and byte-identical to
+    :func:`run_backtest`: any row-level error from either parse, or any target
+    missing a cutoff-available prediction / actual value, rejects the batch.
+    """
+    errors: list[str] = list(predictions.errors) + list(actuals.errors)
+    warnings: list[str] = []
+    if not predictions.rows and predictions.row_count == 0:
+        errors.append("prediction CSV contains no data rows")
+    if not actuals.rows and actuals.row_count == 0:
+        errors.append("actual CSV contains no data rows")
+
+    # ---- cutoff selection over the already-parsed prediction rows ----------
+    selected: dict[tuple[str, datetime], Interval] = {}
+    all_prediction_keys: set[tuple[str, datetime]] = set()
+    ignored_after_cutoff = 0
+
+    for item in predictions.rows:
+        interval = item.interval
+        all_prediction_keys.add((interval.series_id, interval.target_time))
+        if interval.issue_time > cutoff:
+            ignored_after_cutoff += 1
+            continue
+        key = (interval.series_id, interval.target_time)
+        current = selected.get(key)
+        if current is None or interval.issue_time > current.issue_time:
+            selected[key] = interval
+
+    actual_values: dict[tuple[str, datetime], float] = {
+        (item.series_id, item.target_time): item.actual for item in actuals.rows
+    }
 
     # Row-level problems make the coverage check meaningless; report them first.
     if errors:
         raise ValidationError(errors)
 
     # ---- atomic completeness check over every target in the batch ---------
-    all_targets = all_prediction_keys | set(actuals)
+    all_targets = all_prediction_keys | set(actual_values)
     for series_id, target_time in sorted(all_targets, key=lambda k: (k[0], k[1])):
         key = (series_id, target_time)
         if key not in selected:
@@ -282,7 +389,7 @@ def run_backtest(
                 f"series {series_id!r} target {_iso(target_time)} has no prediction "
                 f"issued at or before the cutoff {_iso(cutoff)}"
             )
-        if key not in actuals:
+        if key not in actual_values:
             errors.append(
                 f"series {series_id!r} target {_iso(target_time)} has no actual value"
             )
@@ -302,7 +409,7 @@ def run_backtest(
 
     for key in sorted(selected, key=lambda k: (k[0], k[1])):
         interval = selected[key]
-        actual = actuals[key]
+        actual = actual_values[key]
         lead_seconds = int((interval.target_time - interval.issue_time).total_seconds())
         horizon = _format_duration(lead_seconds)
         width = interval.upper - interval.lower
@@ -350,9 +457,26 @@ def run_backtest(
         misses=misses,
         warnings=warnings,
         submitted_rows={
-            "prediction_rows": len(pred_rows),
-            "actual_rows": len(actual_rows),
+            "prediction_rows": predictions.row_count,
+            "actual_rows": actuals.row_count,
             "selected_predictions": len(selected),
             "evaluated_samples": len(samples),
         },
+    )
+
+
+def run_backtest(
+    *,
+    prediction_csv: bytes,
+    actual_csv: bytes,
+    cutoff_raw: str,
+) -> BacktestResult:
+    """One-shot entry point kept for compatibility and direct callers."""
+    cutoff = parse_cutoff(cutoff_raw)
+    predictions = parse_predictions(prediction_csv)
+    actuals = parse_actuals(actual_csv)
+    return evaluate_backtest(
+        cutoff=cutoff,
+        predictions=predictions,
+        actuals=actuals,
     )

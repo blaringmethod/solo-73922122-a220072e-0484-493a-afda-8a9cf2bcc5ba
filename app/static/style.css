@@ -344,3 +344,41 @@ button.busy .spinner { display: inline-block; }
 
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 .toast.bad { border-color: rgba(248, 113, 113, 0.5); }
+
+/* Prediction parse index reuse banner */
+.index-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 0 4px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  font-size: 12.5px;
+}
+.index-banner code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--muted);
+  font-size: 12px;
+}
+.index-banner .hint { margin-left: auto; }
+.index-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.index-banner.reused { border-color: rgba(52, 211, 153, 0.45); }
+.index-banner.reused .index-pill {
+  color: #06281c;
+  background: var(--ok);
+}
+.index-banner.built { border-color: rgba(91, 140, 255, 0.45); }
+.index-banner.built .index-pill {
+  color: #0b1220;
+  background: var(--accent);
+}

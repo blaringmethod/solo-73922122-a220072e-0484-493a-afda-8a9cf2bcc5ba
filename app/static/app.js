@@ -182,6 +182,14 @@ function renderResult(payload) {
   const totalCovered = horizons.reduce((sum, item) => sum + item.covered_count, 0);
   const overall = totalSamples ? totalCovered / totalSamples : 0;
 
+  const indexInfo = payload.prediction_index
+    ? `<div class="index-banner ${payload.prediction_index.reused ? "reused" : "built"}">
+        <span class="index-pill">${payload.prediction_index.reused ? "♻ 复用解析索引" : "✦ 新建解析索引"}</span>
+        <code title="${escapeHtml(payload.prediction_index.content_sha256)}">${escapeHtml(payload.prediction_index.content_sha256.slice(0, 16))}…</code>
+        <span class="hint">${fmtNumber(payload.prediction_index.byte_size)} 字节 · SHA-256（完整文件字节）</span>
+      </div>`
+    : "";
+
   const meta = `
     <div class="meta-grid">
       <div class="meta"><span>评估截止 (UTC)</span><strong>${escapeHtml(fmtTime(run.cutoff))}</strong></div>
@@ -299,6 +307,7 @@ function renderResult(payload) {
       <a href="/api/backtests/${encodeURIComponent(run.id)}/download/input/prediction.csv">⬇ 原始预测 CSV</a>
       <a href="/api/backtests/${encodeURIComponent(run.id)}/download/input/actual.csv">⬇ 原始实际值 CSV</a>
     </div>
+    ${indexInfo}
     ${meta}
     ${warningBlock}
     <div class="section-title"><h3>各 horizon 统计</h3><span>lead time = issue_time → target_time 的实际时长</span></div>
